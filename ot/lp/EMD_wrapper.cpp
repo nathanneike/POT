@@ -17,6 +17,7 @@
 #include "network_simplex_simple_omp.h"
 #include "sparse_bipartitegraph.h"
 #include "EMD.h"
+#include <cstdlib>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +42,21 @@ inline SetupPolicy make_setup_policy(
     policy.use_arc_mixing = !policy.full_support;
     policy.use_dense_cost_pointer = dense_cost_pointer_supported && policy.full_support;
     return policy;
+}
+
+inline bool sparse_row_pricing_enabled() {
+    const char* env = std::getenv("POT_SPARSE_ROW_PRICING");
+    return env != nullptr && env[0] == '1';
+}
+
+inline bool sparse_row_pricing_stats_enabled() {
+    const char* env = std::getenv("POT_SPARSE_ROW_PRICING_STATS");
+    return env != nullptr && env[0] == '1';
+}
+
+inline bool skip_initial_pivots_enabled() {
+    const char* env = std::getenv("POT_SKIP_INITIAL_PIVOTS");
+    return env != nullptr && env[0] == '1';
 }
 
 template <typename NetType, typename DigraphType>
@@ -436,6 +452,13 @@ int EMD_wrap_sparse(
         di, true, (int)(n + m), di.arcNum(), maxIter
     );
 
+    if (sparse_row_pricing_enabled()) {
+        net.enableRowPricing(true);
+    }
+    if (skip_initial_pivots_enabled()) {
+        net.skipInitialPivots(true);
+    }
+
     net.supplyMap(&weights1[0], (int)n, &weights2[0], (int)m);
 
     for (uint64_t k = 0; k < n_edges; k++) {
@@ -461,6 +484,11 @@ int EMD_wrap_sparse(
     }
     
     int ret = net.run();
+    if (sparse_row_pricing_stats_enabled()) {
+        std::printf("[POT_SPARSE_ROW_PRICING_STATS] enabled=%d iterations=%llu\n",
+                    sparse_row_pricing_enabled() ? 1 : 0,
+                    static_cast<unsigned long long>(net.iterationCount()));
+    }
     if (ret == (int)net.OPTIMAL || ret == (int)net.MAX_ITER_REACHED) {
         *cost = 0;
         *n_flows_out = 0; 

@@ -60,6 +60,7 @@
 
 //#include "sparse_array_n.h"
 #include "full_bipartitegraph.h"
+#include "sparse_pricing.h"
 
 #undef INVALIDNODE
 #undef INVALID
@@ -236,7 +237,8 @@ namespace lemon {
             std::numeric_limits<Value>::infinity() : MAX),
         _lazy_cost(false), _coords_a(nullptr), _coords_b(nullptr), _dim(0), _metric(0), _n1(0), _n2(0),
         _dense_cost(false), _D_ptr(nullptr), _D_n2(0),
-        _warmstart_provided(false), _warmstart_tree_built(false),
+        _row_pricing_enabled(false),
+        _warmstart_provided(false), _warmstart_tree_built(false), _skip_initial_pivots(false), _last_iter_count(0),
         _max_cost(0), _has_max_cost(false)
         {
             // Reset data structures
@@ -356,11 +358,15 @@ namespace lemon {
         bool _dense_cost;
         const double* _D_ptr;  // pointer to row-major cost matrix
         int _D_n2;             // number of columns in D (original n2)
+        bool _row_pricing_enabled;
+        SparsePricingView<ArcsType, Cost> _row_pricing;
 
     private:
         // Warmstart data
         bool _warmstart_provided;  // Flag indicating warmstart is available
         bool _warmstart_tree_built;  // Flag: tree was built by warmstartInit()
+        bool _skip_initial_pivots;
+        uint64_t _last_iter_count;
 
         // Data for storing the spanning tree structure
         IntVector _parent;
@@ -409,6 +415,39 @@ namespace lemon {
         ArcsType subsequence_length;
         ArcsType num_big_subseqiences;
         ArcsType num_total_big_subsequence_numbers;
+
+        bool shouldUseRowPricing() const {
+            return _row_pricing_enabled &&
+                   !_dense_cost &&
+                   !_lazy_cost &&
+                   _n1 > 0 &&
+                   _search_arc_num == _arc_num &&
+                   !_row_pricing.empty();
+        }
+
+        void clearRowPricingView() {
+            _row_pricing.clear();
+        }
+
+        void buildRowPricingView() {
+            _row_pricing.build(
+                _graph,
+                _n1,
+                _arc_num,
+                [this](const Arc& arc) { return getArcID(arc); },
+                [this](int node) { return _node_id(node); },
+                _target,
+                _cost,
+                _state
+            );
+        }
+
+        void setArcState(ArcsType arc, signed char state_value) {
+            _state[arc] = state_value;
+            if (_row_pricing_enabled) {
+                _row_pricing.updateArcState(arc, state_value);
+            }
+        }
 
         inline ArcsType getArcID(const Arc &arc) const
         {
@@ -464,8 +503,10 @@ namespace lemon {
             const CostVector &_cost;
             const StateVector &_state;
             const CostVector &_pi;
+            const SparsePricingView<ArcsType, Cost> &_row_pricing;
             ArcsType &_in_arc;
             ArcsType _search_arc_num;
+            bool _use_row_pricing;
 
             // Pivot rule data
             ArcsType _block_size;
@@ -478,7 +519,9 @@ namespace lemon {
             BlockSearchPivotRule(NetworkSimplexSimple &ns) :
             _source(ns._source), _target(ns._target),
             _cost(ns._cost), _state(ns._state), _pi(ns._pi),
+            _row_pricing(ns._row_pricing),
             _in_arc(ns.in_arc), _search_arc_num(ns._search_arc_num),
+            _use_row_pricing(ns.shouldUseRowPricing()),
             _next_arc(0),_ns(ns)
             {
                 // The main parameters of the pivot rule
@@ -528,6 +571,9 @@ namespace lemon {
 
             // Find next entering arc
             bool findEnteringArc() {
+                if (_use_row_pricing) {
+                    return findEnteringArcByRow();
+                }
                 Cost c, min = 0;
                 ArcsType e;
                 ArcsType cnt = _block_size;
@@ -567,6 +613,62 @@ namespace lemon {
                 return true;
             }
 
+            bool findEnteringArcByRow() {
+                Cost c, min = 0;
+                ArcsType cnt = _block_size;
+                const ArcsType start_pos = _next_arc;
+                const ArcsType nnz = static_cast<ArcsType>(_row_pricing.arc_id.size());
+                double a;
+
+                auto check_candidate = [&]() -> bool {
+                    a = fabs(_pi[_source[_in_arc]]) > fabs(_pi[_target[_in_arc]]) ? fabs(_pi[_source[_in_arc]]) : fabs(_pi[_target[_in_arc]]);
+                    a = a > fabs(_cost[_in_arc]) ? a : fabs(_cost[_in_arc]);
+                    return min < -EPSILON * a;
+                };
+
+                auto scan_range = [&](ArcsType begin, ArcsType end) -> bool {
+                    if (begin >= end) {
+                        return false;
+                    }
+
+                    int row_idx = int(std::upper_bound(_row_pricing.row_ptr.begin(), _row_pricing.row_ptr.end(), begin) -
+                                      _row_pricing.row_ptr.begin() - 1);
+                    while (begin < end) {
+                        while (_row_pricing.row_ptr[row_idx + 1] <= begin) {
+                            ++row_idx;
+                        }
+                        const Cost p_src = _pi[_row_pricing.row_source[row_idx]];
+                        const ArcsType row_end = std::min<ArcsType>(_row_pricing.row_ptr[row_idx + 1], end);
+                        for (; begin < row_end; ++begin) {
+                            const ArcsType e = _row_pricing.arc_id[begin];
+                            c = _row_pricing.sign[begin] * (_row_pricing.cost[begin] + p_src - _pi[_row_pricing.target[begin]]);
+                            if (c < min) {
+                                min = c;
+                                _in_arc = e;
+                            }
+                            if (--cnt == 0) {
+                                if (check_candidate()) {
+                                    _next_arc = begin;
+                                    return true;
+                                }
+                                cnt = _block_size;
+                            }
+                        }
+                    }
+                    return false;
+                };
+
+                if (scan_range(start_pos, nnz) || scan_range(0, start_pos)) {
+                    return true;
+                }
+                if (!check_candidate()) {
+                    return false;
+                }
+
+                _next_arc = start_pos;
+                return true;
+            }
+
         }; //class BlockSearchPivotRule
 
 
@@ -579,6 +681,7 @@ namespace lemon {
         int n1() const { return _n1; }
         int n2() const { return _n2; }
         Cost pi(int internal_node) const { return _pi[internal_node]; }
+        uint64_t iterationCount() const { return _last_iter_count; }
 
         int _init_nb_nodes;
         ArcsType _init_nb_arcs;
@@ -682,6 +785,19 @@ namespace lemon {
             return *this;
         }
 
+        NetworkSimplexSimple& enableRowPricing(bool enable = true) {
+            _row_pricing_enabled = enable;
+            if (!enable) {
+                clearRowPricingView();
+            }
+            return *this;
+        }
+
+        NetworkSimplexSimple& skipInitialPivots(bool skip = true) {
+            _skip_initial_pivots = skip;
+            return *this;
+        }
+
         /// \brief Compute cost lazily from coordinates.
         ///
         /// Computes the distance between source node i and target node j
@@ -773,6 +889,8 @@ namespace lemon {
         }
         template<typename SupplyMap>
         NetworkSimplexSimple& supplyMap(const SupplyMap* map1, int n1, const SupplyMap* map2, int n2) {
+            _n1 = n1;
+            _n2 = n2;
             Node n; _graph.first(n);
             for (; n != INVALIDNODE; _graph.next(n)) {
                 if (n<n1)
@@ -1014,6 +1132,7 @@ namespace lemon {
             _succ_num.resize(all_node_num);
             _last_succ.resize(all_node_num);
             _state.resize(max_arc_num);
+            clearRowPricingView();
 
 
             //_arc_mixing=false;
@@ -1205,7 +1324,7 @@ namespace lemon {
                 std::priority_queue<HeapEntry> maxheap;
 
                 for (ArcsType e = 0; e < _arc_num; ++e) {
-                    _state[e] = STATE_LOWER;
+                    setArcState(e, STATE_LOWER);
                     Cost c;
                     if (_lazy_cost) {
                         // Compute cost on-the-fly for lazy mode
@@ -1313,7 +1432,7 @@ namespace lemon {
             _root = _node_num;
 
             for (ArcsType u = 0, e = _arc_num; u != _node_num; ++u, ++e) {
-                _state[e] = STATE_TREE;
+                setArcState(e, STATE_TREE);
                 if (_supply[u] >= 0) {
                     _source[e] = u;
                     _target[e] = _root;
@@ -1344,7 +1463,7 @@ namespace lemon {
                 _parent[u] = _root;
                 _pred[u] = _arc_num + u;
                 _forward[u] = (_supply[u] >= 0);  // same as init()
-                _state[_arc_num + u] = STATE_TREE;
+                setArcState(_arc_num + u, STATE_TREE);
                 visited[u] = true;
 
                 std::queue<int> bfs_queue;
@@ -1360,10 +1479,10 @@ namespace lemon {
                         
                         _parent[w] = v;
                         _pred[w] = arc_e;
-                        _state[arc_e] = STATE_TREE;
+                        setArcState(arc_e, STATE_TREE);
                         _forward[w] = (_source[arc_e] == w);
                         
-                        _state[_arc_num + w] = STATE_LOWER;
+                        setArcState(_arc_num + w, STATE_LOWER);
                         _flow[_arc_num + w] = 0;
                         
                         bfs_queue.push(w);
@@ -1445,7 +1564,7 @@ namespace lemon {
                         net[_parent[u]] += net[u];
                     } else {
                         if (e < _arc_num) {
-                            _state[e] = STATE_LOWER;
+                            setArcState(e, STATE_LOWER);
                             _flow[e] = 0;
                         }
                         // Reconnect u to root via artificial arc
@@ -1453,7 +1572,7 @@ namespace lemon {
                         _parent[u] = _root;
                         _pred[u] = art_e;
                         _forward[u] = (_source[art_e] == u);
-                        _state[art_e] = STATE_TREE;
+                        setArcState(art_e, STATE_TREE);
                         
                         Value art_f = _forward[u] ? net[u] : -net[u];
                         _flow[art_e] = art_f >= 0 ? art_f : -art_f;
@@ -1571,6 +1690,9 @@ namespace lemon {
             }
 
             memset(&_state[0], STATE_LOWER, _arc_num);
+            if (_row_pricing_enabled && !_dense_cost && !_lazy_cost) {
+                buildRowPricingView();
+            }
 
             // Set data for the artificial root node
             _root = _node_num;
@@ -1595,7 +1717,7 @@ namespace lemon {
                     _rev_thread[u + 1] = u;
                     _succ_num[u] = 1;
                     _last_succ[u] = u;
-                    _state[e] = STATE_TREE;
+                    setArcState(e, STATE_TREE);
                     if (_supply[u] >= 0) {
                         _forward[u] = true;
                         _pi[u] = 0;
@@ -1631,7 +1753,7 @@ namespace lemon {
                         _target[e] = _root;
                         _flow[e] = _supply[u];
                         _cost[e] = 0;
-                        _state[e] = STATE_TREE;
+                        setArcState(e, STATE_TREE);
                     } else {
                         _forward[u] = false;
                         _pi[u] = ART_COST;
@@ -1640,12 +1762,12 @@ namespace lemon {
                         _target[f] = u;
                         _flow[f] = -_supply[u];
                         _cost[f] = ART_COST;
-                        _state[f] = STATE_TREE;
+                        setArcState(f, STATE_TREE);
                         _source[e] = u;
                         _target[e] = _root;
                         //_flow[e] = 0;  //by default, the sparse matrix is empty
                         _cost[e] = 0;
-                        _state[e] = STATE_LOWER;
+                        setArcState(e, STATE_LOWER);
                         ++f;
                     }
                 }
@@ -1669,7 +1791,7 @@ namespace lemon {
                         _target[e] = u;
                         _flow[e] = -_supply[u];
                         _cost[e] = 0;
-                        _state[e] = STATE_TREE;
+                        setArcState(e, STATE_TREE);
                     } else {
                         _forward[u] = true;
                         _pi[u] = -ART_COST;
@@ -1677,13 +1799,13 @@ namespace lemon {
                         _source[f] = u;
                         _target[f] = _root;
                         _flow[f] = _supply[u];
-                        _state[f] = STATE_TREE;
+                        setArcState(f, STATE_TREE);
                         _cost[f] = ART_COST;
                         _source[e] = _root;
                         _target[e] = u;
                         //_flow[e] = 0;
                         _cost[e] = 0;
-                        _state[e] = STATE_LOWER;
+                        setArcState(e, STATE_LOWER);
                         ++f;
                     }
                 }
@@ -1770,11 +1892,11 @@ namespace lemon {
             }
             // Update the state of the entering and leaving arcs
             if (change) {
-                _state[in_arc] = STATE_TREE;
-                _state[_pred[u_out]] =
-                (_flow[_pred[u_out]] == 0) ? STATE_LOWER : STATE_UPPER;
+                setArcState(in_arc, STATE_TREE);
+                setArcState(_pred[u_out],
+                            (_flow[_pred[u_out]] == 0) ? STATE_LOWER : STATE_UPPER);
             } else {
-                _state[in_arc] = -_state[in_arc];
+                setArcState(in_arc, -_state[in_arc]);
             }
         }
 
@@ -2018,9 +2140,10 @@ namespace lemon {
         ProblemType start() {
             PivotRuleImpl pivot(*this);
 			ProblemType retVal = OPTIMAL;
+            _last_iter_count = 0;
 
             // Perform heuristic initial pivots (skip if warmstart tree was built)
-            if (!_warmstart_tree_built) {
+            if (!_warmstart_tree_built && !_skip_initial_pivots) {
                 if (!initialPivots()) return UNBOUNDED;
             }
 
@@ -2044,6 +2167,7 @@ namespace lemon {
                 }
 
             }
+            _last_iter_count = iter_number;
 
             // Check feasibility
 			if( retVal == OPTIMAL){
